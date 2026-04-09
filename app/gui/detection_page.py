@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QProgressBar, QListWidget, QListWidgetItem, QDoubleSpinBox,
     QGroupBox, QFormLayout, QSplitter, QSpinBox, QMessageBox,
-    QInputDialog, QFrame
+    QInputDialog, QFrame, QCheckBox, QLineEdit
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QColor
@@ -82,6 +82,16 @@ class DetectionPage(QWidget):
         self.spin_sample.setValue(2)
         self.spin_sample.setSuffix(" (每N帧处理1次)")
         cfg_form.addRow("跳帧加速:", self.spin_sample)
+
+        # YOLO检测配置
+        self.chk_use_yolo = QCheckBox("启用YOLO深度学习检测")
+        self.chk_use_yolo.setChecked(False)
+        cfg_form.addRow("", self.chk_use_yolo)
+
+        self.txt_yolo_model = QLineEdit()
+        self.txt_yolo_model.setText("yolo11n.pt")
+        self.txt_yolo_model.setPlaceholderText("YOLO模型路径")
+        cfg_form.addRow("YOLO模型:", self.txt_yolo_model)
 
         root.addWidget(cfg_box)
 
@@ -201,6 +211,8 @@ class DetectionPage(QWidget):
             pre_roll=self.spin_pre.value(),
             post_roll=self.spin_post.value(),
             sample_every_n=self.spin_sample.value(),
+            use_yolo=self.chk_use_yolo.isChecked(),
+            yolo_model_path=self.txt_yolo_model.text(),
         )
 
         def worker():
