@@ -1,0 +1,41 @@
+# 忽略的文件和目录
+
+# 操作系统生成的文件
+.DS_Store
+Thumbs.db
+
+# Python相关
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+venv/
+env/
+env.local/
+
+# 项目生成的文件
+output/
+clips/
+thumbnails/
+*.mp4
+
+# IDE相关
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+
+# 测试文件
+test_*.py
+
+# 导出的文档
+*.pdf
+*.docx
