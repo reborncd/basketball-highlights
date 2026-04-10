@@ -51,10 +51,10 @@ class DetectionConfig:
     goal_zone_offset: float = 100.0      # 进球区偏移(像素)
     shot_window: float = 1.5             # 时间窗口(秒)
     # 轨迹验证参数
-    trajectory_validation_frames_min: int = 10  # 轨迹验证最小帧数
-    trajectory_validation_frames_max: int = 15  # 轨迹验证最大帧数
-    required_slope_threshold: float = 0.5       # 最小下降斜率
-    lateral_tolerance_ratio: float = 1.5         # 横向容忍度（篮筐半径的倍数）
+    trajectory_validation_frames_min: int = 5  # 轨迹验证最小帧数
+    trajectory_validation_frames_max: int = 10  # 轨迹验证最大帧数
+    required_slope_threshold: float = 0.3       # 最小下降斜率
+    lateral_tolerance_ratio: float = 2.0         # 横向容忍度（篮筐半径的倍数）
     # 篮筐校准参数
     calibration_samples: int = 30         # 校准样本数
     # YOLO检测参数（暂时禁用）
@@ -395,6 +395,22 @@ class GoalDetector:
         # 进球确认追踪
         self.frames_in_goal_zone: int = 0  # 进球区内连续帧数
         self.last_in_goal_frame: int = -1  # 上次在进球区的帧索引
+        
+        # YOLO检测相关
+        self.yolo_detector = None
+        if config.use_yolo:
+            try:
+                self.yolo_detector = YOLOSportsDetector(
+                    model_path=config.yolo_model_path,
+                    conf_thres=config.yolo_conf_thres,
+                    iou_thres=config.yolo_iou_thres,
+                    imgsz=config.yolo_imgsz,
+                    device=config.yolo_device
+                )
+                logger.info("✅ YOLO检测已启用")
+            except Exception as e:
+                logger.error(f"❌ YOLO初始化失败: {e}")
+                self.yolo_detector = None
 
     def _define_zones(self):
         """根据篮筐位置定义三个关键区域"""
@@ -609,12 +625,30 @@ class GoalDetector:
         self._check_state_timeout(timestamp)
 
         # 检测篮球
-        ball = self.tracker.detect(frame, frame_idx, timestamp, config)
+        ball = None
+        if self.yolo_detector:
+            # 使用YOLO检测篮球
+            yolo_ball = self.yolo_detector.detect_ball(frame)
+            if yolo_ball and yolo_ball["conf"] > config.yolo_conf_thres:
+                cx, cy = yolo_ball["center"]
+                x1, y1, x2, y2 = yolo_ball["bbox"]
+                radius = (x2 - x1) / 2
+                ball = BallDetection(cx, cy, radius, frame_idx, timestamp)
+                self.tracker.history.append(ball)
+                if len(self.tracker.history) > self.tracker.max_history:
+                    self.tracker.history.pop(0)
+                self.ball_detected_count += 1
+                if self.ball_detected_count % 50 == 0:
+                    logger.debug(f"🏀 YOLO篮球检测: 位置({cx:.0f}, {cy:.0f}), 置信度{yolo_ball['conf']:.2f}")
+        else:
+            # 传统方法检测篮球
+            ball = self.tracker.detect(frame, frame_idx, timestamp, config)
+            if ball:
+                self.ball_detected_count += 1
+                if self.ball_detected_count % 50 == 0:
+                    logger.debug(f"🏀 传统篮球检测: 位置({ball.cx:.0f}, {ball.cy:.0f}), 半径{ball.radius:.0f}")
+        
         if ball:
-            self.ball_detected_count += 1
-            if self.ball_detected_count % 50 == 0:
-                logger.debug(f"🏀 篮球检测: 位置({ball.cx:.0f}, {ball.cy:.0f}), 半径{ball.radius:.0f}")
-            
             # 状态机转换逻辑
             goal_detected = self._update_state_machine(ball, timestamp, config)
             if goal_detected:
