@@ -24,8 +24,19 @@ class YOLOSportsDetector:
     def __post_init__(self):
         """初始化YOLO模型"""
         try:
+            # 检测设备可用性
+            import torch
+            if torch.cuda.is_available():
+                device = self.device
+            else:
+                # 没有CUDA时使用CPU
+                device = "cpu"
+                logger.info("⚠️ CUDA不可用，使用CPU")
+            
             self.model = YOLO(self.model_path)
-            logger.info(f"✅ YOLO模型加载成功: {self.model_path}")
+            # 显式设置设备
+            self.device = device
+            logger.info(f"✅ YOLO模型加载成功: {self.model_path}, 设备: {device}")
         except Exception as e:
             logger.error(f"❌ YOLO模型加载失败: {e}")
             self.model = None
@@ -44,12 +55,13 @@ class YOLOSportsDetector:
             return []
         
         try:
+            # 确保使用正确的设备
             results = self.model.predict(
                 frame,
                 conf=self.conf_thres,
                 iou=self.iou_thres,
                 imgsz=self.imgsz,
-                device=self.device,
+                device="cpu" if self.device == "auto" else self.device,
                 verbose=False
             )
             

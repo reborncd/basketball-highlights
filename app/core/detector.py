@@ -20,10 +20,9 @@ class DetectionConfig:
     min_ball_radius: int = 8    # 篮球最小半径(像素)
     max_ball_radius: int = 60   # 篮球最大半径(像素)
     hoop_y_ratio: float = 0.55  # 篮筐大致所在高度比例(画面上半部分)
-    net_change_threshold: float = 0.025  # 球网变化阈值(降低以提高灵敏度)
-    trajectory_min_frames: int = 5      # 判断轨迹所需最少帧数
-    goal_cooldown: float = 8.0          # 两次进球最短间隔(秒), 防止重复
-    sample_every_n: int = 2             # 每N帧处理一次，加快速度
+    trajectory_min_frames: int = 3      # 判断轨迹所需最少帧数
+    goal_cooldown: float = 3.0          # 两次进球最短间隔(秒), 防止重复
+    sample_every_n: int = 1             # 每N帧处理一次，加快速度
     # 篮筐检测参数
     canny_low_threshold: int = 40       # Canny边缘检测低阈值
     canny_high_threshold: int = 120     # Canny边缘检测高阈值
@@ -37,14 +36,13 @@ class DetectionConfig:
     hoop_detection_interval: int = 20    # 篮筐检测间隔帧数
     hoop_history_size: int = 10         # 篮筐位置历史大小
     hoop_stability_threshold: int = 3    # 篮筐位置稳定阈值
-    # 球网检测增强参数
-    net_light_compensation: bool = True  # 是否启用光线补偿
-    net_edge_weight: float = 0.6        # 边缘变化权重
-    net_intensity_weight: float = 0.4   # 强度变化权重
-    net_histogram_bins: int = 16        # 直方图 bins 数
-    net_histogram_threshold: float = 0.15  # 直方图变化阈值
-    net_motion_threshold: int = 15      # 运动检测阈值
-    # YOLO检测参数
+    # 三阶段区域判定参数
+    high_zone_offset: float = 150.0     # 高位区偏移(像素)
+    goal_zone_offset: float = 150.0      # 进球区偏移(像素)
+    shot_window: float = 2.5             # 时间窗口(秒)
+    # 篮筐校准参数
+    calibration_samples: int = 30         # 校准样本数
+    # YOLO检测参数（暂时禁用）
     use_yolo: bool = False              # 是否使用YOLO检测
     yolo_model_path: str = "yolo11n.pt"  # YOLO模型路径
     yolo_conf_thres: float = 0.25       # YOLO置信度阈值
@@ -351,7 +349,10 @@ class BallTracker:
 
 class GoalDetector:
     """
-    进球检测：结合传统方法和YOLO深度学习
+    进球检测：采用griftt/ball-yolo的三阶段区域判定法
+    1. 高位区 - 篮球在篮筐上方
+    2. 触框区 - 篮球与篮筐重叠
+    3. 进球区 - 篮球穿过篮筐下方
     """
 
     def __init__(self, config: DetectionConfig):
@@ -362,92 +363,102 @@ class GoalDetector:
         self.hoop_detected = False
         self.frame_count = 0
         self.ball_detected_count = 0
-        # 球网检测相关变量
-        self.prev_net_frame = None
-        self.prev_net_edge = None
-        self.prev_net_hist = None
-        self.net_change_history = []
-        self.net_change_window = 7  # 扩大球网变化检测窗口大小
-        self.net_stability_threshold = 0.015  # 球网稳定阈值
-        self.light_level_history = []  # 光线强度历史
-        self.max_light_history = 10
-        # YOLO检测相关
-        self.yolo_detector = None
-        if config.use_yolo:
-            try:
-                self.yolo_detector = YOLOSportsDetector(
-                    model_path=config.yolo_model_path,
-                    conf_thres=config.yolo_conf_thres,
-                    iou_thres=config.yolo_iou_thres,
-                    imgsz=config.yolo_imgsz,
-                    device=config.yolo_device
-                )
-                logger.info("✅ YOLO检测已启用")
-            except Exception as e:
-                logger.error(f"❌ YOLO初始化失败: {e}")
-                self.yolo_detector = None
-
-    def _predict_trajectory(self, positions: list[BallDetection]) -> tuple[Optional[float], Optional[float], Optional[float]]:
-        """使用线性回归预测轨迹
-        返回 (a, b, r2): y = a*x + b, r2是拟合度
-        """
-        if len(positions) < 3:
-            return None, None, None
         
-        x = np.array([p.cx for p in positions], dtype=np.float32)
-        y = np.array([p.cy for p in positions], dtype=np.float32)
+        # 三阶段判定状态
+        self.last_high_zone_ts: float = -999.0
+        self.last_rim_touch_ts: float = -999.0
         
-        # 线性回归
-        if len(x) > 1:
-            coefficients = np.polyfit(x, y, 1)
-            a, b = coefficients
-            # 计算R²
-            y_pred = a * x + b
-            ss_res = np.sum((y - y_pred) ** 2)
-            ss_tot = np.sum((y - np.mean(y)) ** 2)
-            r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-            return a, b, r2
-        return None, None, None
+        # 篮筐校准
+        self.calibration_buffer: list = []
+        self.is_calibrated: bool = False
+        self.locked_hoop_rect: Optional[tuple] = None
+        
+        # 区域定义
+        self.high_zone: Optional[tuple] = None
+        self.rim_zone: Optional[tuple] = None
+        self.goal_zone: Optional[tuple] = None
 
-    def _check_trajectory_through_hoop(self) -> bool:
-        """检查最近轨迹是否从篮筐上方穿越到下方（简化版）"""
-        if not self.hoop.hoop_rect:
-            return False
-        positions = self.tracker.get_recent_positions(20)
-        if len(positions) < self.config.trajectory_min_frames:
-            return False
-
-        hx, hy, hw, hh = self.hoop.hoop_rect
+    def _define_zones(self):
+        """根据篮筐位置定义三个关键区域"""
+        if not self.locked_hoop_rect:
+            return
+            
+        hx, hy, hw, hh = self.locked_hoop_rect
         hoop_cx = hx + hw // 2
         hoop_cy = hy + hh // 2
         hoop_r = hw // 2
-
-        # 找到在篮筐横向范围内的点
-        near = [p for p in positions if abs(p.cx - hoop_cx) < hoop_r * 2.5]  # 扩大范围
-        if len(near) < 2:
-            logger.debug(f"轨迹检测失败: 篮筐附近点不够 {len(near)}")
-            return False
-
-        # 传统的上下穿越判断（简化条件）
-        above = [p for p in near if p.cy < hoop_cy + hh * 0.8]  # 篮筐上方（扩大范围）
-        below = [p for p in near if p.cy > hoop_cy + hh * 1.2]  # 篮筐下方（扩大范围）
-
-        if not above or not below:
-            logger.debug(f"轨迹检测失败: 上方{len(above)}, 下方{len(below)}")
-            return False
-
-        # 时间顺序：先above后below
-        last_above = max(above, key=lambda p: p.frame_idx)
-        first_below = min(below, key=lambda p: p.frame_idx)
         
-        if first_below.frame_idx <= last_above.frame_idx:
-            logger.debug(f"轨迹检测失败: 时间顺序不对")
+        # 高位区：篮筐上方
+        offset = self.config.high_zone_offset
+        self.high_zone = (
+            hoop_cx - hoop_r * 2,
+            hoop_cy - offset,
+            hoop_cx + hoop_r * 2,
+            hoop_cy + hh * 0.5
+        )
+        
+        # 篮筐区
+        self.rim_zone = (hx - 10, hy - 10, hx + hw + 10, hy + hh + 10)
+        
+        # 进球区：篮筐下方
+        goal_offset = self.config.goal_zone_offset
+        self.goal_zone = (
+            hoop_cx - hoop_r * 2,
+            hoop_cy + hh,
+            hoop_cx + hoop_r * 2,
+            hoop_cy + hh + goal_offset
+        )
+    
+    def _is_in_zone(self, ball: BallDetection, zone: tuple) -> bool:
+        """检查球是否在指定区域内"""
+        if not zone:
             return False
+        zx1, zy1, zx2, zy2 = zone
+        return zx1 < ball.cx < zx2 and zy1 < ball.cy < zy2
+    
+    def _is_in_high_zone(self, ball: BallDetection) -> bool:
+        return self._is_in_zone(ball, self.high_zone)
+    
+    def _is_touching_rim(self, ball: BallDetection) -> bool:
+        return self._is_in_zone(ball, self.rim_zone)
+    
+    def _is_in_goal_zone(self, ball: BallDetection) -> bool:
+        return self._is_in_zone(ball, self.goal_zone)
+
+    def _calibrate_hoop(self, frame: np.ndarray, config: DetectionConfig, frame_idx: int):
+        """篮筐位置校准"""
+        if self.is_calibrated:
+            return
         
-        # 记录轨迹信息
-        logger.info(f"✅ 轨迹检测成功: 上方{len(above)}, 下方{len(below)}, 上方帧{last_above.frame_idx}, 下方帧{first_below.frame_idx}")
-        
-        return True
+        if self.hoop.detect(frame, config, frame_idx):
+            if self.hoop.hoop_rect:
+                self.calibration_buffer.append(self.hoop.hoop_rect)
+                if len(self.calibration_buffer) >= config.calibration_samples:
+                    # 使用中位数计算稳定的篮筐位置
+                    xs = [r[0] for r in self.calibration_buffer]
+                    ys = [r[1] for r in self.calibration_buffer]
+                    ws = [r[2] for r in self.calibration_buffer]
+                    hs = [r[3] for r in self.calibration_buffer]
+                    
+                    self.locked_hoop_rect = (
+                        int(np.median(xs)),
+                        int(np.median(ys)),
+                        int(np.median(ws)),
+                        int(np.median(hs))
+                    )
+                    
+                    # 更新篮筐位置
+                    self.hoop.hoop_rect = self.locked_hoop_rect
+                    cx, cy, w, h = self.locked_hoop_rect
+                    r = w // 2
+                    self.hoop.net_region = (cx, cy + h, w, int(r * 1.8))
+                    
+                    # 定义三个关键区域
+                    self._define_zones()
+                    
+                    self.is_calibrated = True
+                    self.hoop_detected = True
+                    logger.info(f"✅ 篮筐校准完成: 位置{self.locked_hoop_rect}")
 
     def process_frame(self, frame: np.ndarray, frame_idx: int, timestamp: float) -> bool:
         """
@@ -456,253 +467,73 @@ class GoalDetector:
         self.frame_count += 1
         config = self.config
 
-        # 首帧或按配置间隔重新检测篮筐
-        if not self.hoop_detected or frame_idx % config.hoop_detection_interval == 0:
-            # 优先使用YOLO检测篮筐
-            if self.yolo_detector:
-                yolo_hoop = self.yolo_detector.detect_hoop(frame)
-                if yolo_hoop and yolo_hoop["conf"] > config.yolo_conf_thres:
-                    x1, y1, x2, y2 = yolo_hoop["bbox"]
-                    # 设置篮筐位置
-                    self.hoop.hoop_rect = (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
-                    self.hoop.net_region = (int(x1), int(y1), int(x2 - x1), int((y2 - y1) * 1.5))
-                    if not self.hoop_detected:
-                        logger.info(f"✅ YOLO篮筐检测成功")
-                    self.hoop_detected = True
-            else:
-                # 传统方法检测篮筐
-                if self.hoop.detect(frame, config, frame_idx):
-                    if not self.hoop_detected:
-                        logger.info(f"✅ 传统篮筐检测成功")
-                    self.hoop_detected = True
-                else:
-                    if self.frame_count % 100 == 0:
-                        logger.debug(f"⏳ 尝试检测篮筐中...")
+        # 首帧或未校准前进行篮筐校准
+        if not self.is_calibrated:
+            self._calibrate_hoop(frame, config, frame_idx)
+            if not self.hoop_detected:
+                if self.frame_count % 50 == 0:
+                    logger.debug(f"⏳ 正在校准篮筐位置... ({len(self.calibration_buffer)}/{config.calibration_samples})")
+                return False
 
         # 检测篮球
-        ball = None
-        if self.yolo_detector:
-            # 使用YOLO检测篮球
-            yolo_ball = self.yolo_detector.detect_ball(frame)
-            if yolo_ball and yolo_ball["conf"] > config.yolo_conf_thres:
-                cx, cy = yolo_ball["center"]
-                x1, y1, x2, y2 = yolo_ball["bbox"]
-                radius = (x2 - x1) / 2
-                ball = BallDetection(cx, cy, radius, frame_idx, timestamp)
-                self.tracker.history.append(ball)
-                if len(self.tracker.history) > self.tracker.max_history:
-                    self.tracker.history.pop(0)
-                self.ball_detected_count += 1
-                if self.ball_detected_count % 50 == 0:
-                    logger.debug(f"🏀 YOLO篮球检测: 位置({cx:.0f}, {cy:.0f}), 置信度{yolo_ball['conf']:.2f}")
-        else:
-            # 传统方法检测篮球
-            ball = self.tracker.detect(frame, frame_idx, timestamp, config)
-            if ball:
-                self.ball_detected_count += 1
-                if self.ball_detected_count % 50 == 0:
-                    logger.debug(f"🏀 传统篮球检测: 位置({ball.cx:.0f}, {ball.cy:.0f}), 半径{ball.radius:.0f}")
-
-        # 判断进球（冷却时间内不重复触发）
-        if timestamp - self.last_goal_time < config.goal_cooldown:
-            return False
-
-        # 只有当篮筐检测到后才进行轨迹分析（篮球不是必须每帧都检测到）
-        if not self.hoop_detected:
-            return False
-
-        # 检查是否有足够的轨迹点
-        positions = self.tracker.get_recent_positions(20)
-        if len(positions) < config.trajectory_min_frames:
-            return False
-
-        trajectory_ok = self._check_trajectory_through_hoop()
-
-        # 只要轨迹检测OK就认为进球
-        if trajectory_ok:
-            # 记录进球时间
-            self.last_goal_time = timestamp
-            # 清空轨迹历史，避免重复检测
-            self.tracker.history = []
-            # 清空球网变化历史
-            self.net_change_history = []
-            logger.info(f"✅ 进球检测成功！时间戳 {timestamp:.1f}s")
-            return True
+        ball = self.tracker.detect(frame, frame_idx, timestamp, config)
+        if ball:
+            self.ball_detected_count += 1
+            if self.ball_detected_count % 50 == 0:
+                logger.debug(f"🏀 篮球检测: 位置({ball.cx:.0f}, {ball.cy:.0f}), 半径{ball.radius:.0f}")
+            
+            # 检查是否在高位区
+            if self._is_in_high_zone(ball):
+                self.last_high_zone_ts = timestamp
+                logger.debug(f"📍 篮球进入高位区: {timestamp:.1f}s")
+            
+            # 检查是否触框
+            if self._is_touching_rim(ball):
+                self.last_rim_touch_ts = timestamp
+                logger.debug(f"🎯 篮球触框: {timestamp:.1f}s")
+            
+            # 检查是否在进球区
+            if self._is_in_goal_zone(ball):
+                logger.debug(f"⬇️  篮球进入进球区: {timestamp:.1f}s")
+                
+                # 检查时间窗口
+                last_interaction = max(self.last_high_zone_ts, self.last_rim_touch_ts)
+                time_diff = timestamp - last_interaction
+                
+                # 冷却时间检查
+                if timestamp - self.last_goal_time < config.goal_cooldown:
+                    return False
+                
+                # 检查是否在合理的时间窗口内（0.05秒到2.5秒）
+                if 0.05 < time_diff < config.shot_window:
+                    logger.info(f"✅ 进球检测成功！时间戳 {timestamp:.1f}s, 时间差 {time_diff:.2f}s")
+                    self.last_goal_time = timestamp
+                    # 重置状态
+                    self.last_high_zone_ts = -999.0
+                    self.last_rim_touch_ts = -999.0
+                    return True
 
         return False
 
-    def _compute_light_level(self, gray: np.ndarray) -> float:
-        """计算图像的光线强度水平"""
-        return np.mean(gray)
-    
-    def _adaptive_light_compensation(self, gray: np.ndarray) -> np.ndarray:
-        """自适应光线补偿，减少光线变化影响"""
-        if not self.config.net_light_compensation:
-            return gray
-        
-        current_light = self._compute_light_level(gray)
-        self.light_level_history.append(current_light)
-        
-        if len(self.light_level_history) > self.max_light_history:
-            self.light_level_history.pop(0)
-        
-        if len(self.light_level_history) < 3:
-            return gray
-        
-        # 计算历史平均光线水平
-        avg_light = np.mean(self.light_level_history[:-1])
-        if avg_light == 0:
-            return gray
-        
-        # 补偿因子，避免过度补偿
-        light_ratio = avg_light / current_light
-        light_ratio = np.clip(light_ratio, 0.7, 1.4)
-        
-        # 应用光线补偿
-        compensated = cv2.convertScaleAbs(gray, alpha=light_ratio, beta=0)
-        return compensated
-    
-    def _extract_net_features(self, roi: np.ndarray):
-        """从球网区域提取多种特征"""
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # 光线补偿
-        compensated = self._adaptive_light_compensation(blurred)
-        
-        # 边缘检测
-        edges = cv2.Canny(compensated, 30, 80)
-        
-        # 计算直方图
-        hist = cv2.calcHist([compensated], [0], None, [self.config.net_histogram_bins], [0, 256])
-        hist = cv2.normalize(hist, hist).flatten()
-        
-        return compensated, edges, hist
-    
-    def _update_net_frame(self, frame: np.ndarray):
-        if self.hoop.net_region:
-            x, y, w, h = self.hoop.net_region
-            fh, fw = frame.shape[:2]
-            x = max(0, x); y = max(0, y)
-            x2 = min(fw, x + w); y2 = min(fh, y + h)
-            roi = frame[y:y2, x:x2]
-            if roi.size > 0:
-                # 提取多种特征
-                gray, edges, hist = self._extract_net_features(roi)
-                self.prev_net_frame = gray
-                self.prev_net_edge = edges
-                self.prev_net_hist = hist
-
-    def _detect_net_change(self, frame: np.ndarray) -> float:
-        """检测球网区域的像素变化（改进版）
-        结合强度变化、边缘变化和直方图变化
-        """
-        if not self.hoop.net_region or self.prev_net_frame is None:
-            return 0.0
-        
-        x, y, w, h = self.hoop.net_region
-        fh, fw = frame.shape[:2]
-        x = max(0, x); y = max(0, y)
-        x2 = min(fw, x + w); y2 = min(fh, y + h)
-        roi = frame[y:y2, x:x2]
-        
-        if roi.size == 0:
-            return 0.0
-        
-        # 提取当前帧的特征
-        current_gray, current_edges, current_hist = self._extract_net_features(roi)
-        
-        # 检查历史帧和当前帧的大小是否匹配
-        if (self.prev_net_frame.shape != current_gray.shape or 
-            self.prev_net_edge.shape != current_edges.shape):
-            # 大小不匹配，更新历史帧并返回0
-            self.prev_net_frame = current_gray
-            self.prev_net_edge = current_edges
-            self.prev_net_hist = current_hist
-            return 0.0
-        
-        # 1. 强度变化
-        diff_intensity = cv2.absdiff(self.prev_net_frame, current_gray)
-        _, thresh_intensity = cv2.threshold(diff_intensity, self.config.net_motion_threshold, 255, cv2.THRESH_BINARY)
-        change_intensity = np.sum(thresh_intensity) / (thresh_intensity.size * 255)
-        
-        # 2. 边缘变化
-        diff_edges = cv2.absdiff(self.prev_net_edge, current_edges)
-        change_edges = np.sum(diff_edges) / (diff_edges.size * 255)
-        
-        # 3. 直方图变化（卡方距离）
-        hist_diff = cv2.compareHist(self.prev_net_hist, current_hist, cv2.HISTCMP_CHISQR)
-        max_hist_diff = 2.0  # 经验最大差异值
-        change_hist = min(hist_diff / max_hist_diff, 1.0)
-        
-        # 综合变化值（加权平均）
-        total_change = (
-            self.config.net_intensity_weight * change_intensity +
-            self.config.net_edge_weight * change_edges +
-            0.3 * change_hist  # 直方图变化权重
-        )
-        
-        # 更新历史特征
-        self.prev_net_frame = current_gray
-        self.prev_net_edge = current_edges
-        self.prev_net_hist = current_hist
-        
-        # 记录变化历史
-        self.net_change_history.append(total_change)
-        if len(self.net_change_history) > self.net_change_window:
-            self.net_change_history.pop(0)
-        
-        return total_change
-
-    def _is_net_change_significant(self) -> bool:
-        """判断球网变化是否显著（改进版）
-        考虑历史变化趋势、峰值检测和变化持续性
-        """
-        if len(self.net_change_history) < 4:
-            return False
-        
-        # 获取最近的变化值
-        recent_changes = self.net_change_history[-5:] if len(self.net_change_history) >= 5 else self.net_change_history
-        
-        # 计算统计指标
-        avg_change = np.mean(self.net_change_history[:-1])  # 排除当前帧
-        std_change = np.std(self.net_change_history[:-1])
-        current_change = self.net_change_history[-1]
-        prev_change = self.net_change_history[-2]
-        
-        # 条件1：当前变化显著大于平均水平
-        threshold = max(
-            self.config.net_change_threshold,
-            avg_change + 1.5 * std_change
-        )
-        
-        # 条件2：变化呈上升趋势或出现峰值
-        is_rising = current_change > prev_change * 1.2
-        is_peak = (current_change > avg_change * 2 and 
-                   current_change > self.net_stability_threshold)
-        
-        # 条件3：变化在合理范围内，避免因光线突变导致的误检
-        is_reasonable = current_change < 0.6
-        
-        # 条件4：检查最近几帧是否有持续的变化
-        has_sustained_change = sum(1 for c in recent_changes if c > self.config.net_change_threshold * 0.5) >= 2
-        
-        # 综合判断
-        significant = (
-            current_change > threshold and
-            (is_rising or is_peak) and
-            is_reasonable and
-            has_sustained_change
-        )
-        
-        if significant:
-            logger.debug(f"球网变化显著: 当前={current_change:.3f}, 平均={avg_change:.3f}, 阈值={threshold:.3f}")
-        
-        return significant
-
     def draw_debug(self, frame: np.ndarray) -> np.ndarray:
-        """在帧上绘制调试信息"""
+        """在帧上绘制调试信息，包括三阶段区域"""
         frame = self.hoop.draw(frame)
+        
+        # 绘制三阶段区域
+        if self.high_zone:
+            zx1, zy1, zx2, zy2 = self.high_zone
+            cv2.rectangle(frame, (int(zx1), int(zy1)), (int(zx2), int(zy2)), (255, 255, 0), 2)
+            cv2.putText(frame, "HIGH", (int(zx1), int(zy1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+        
+        if self.rim_zone:
+            zx1, zy1, zx2, zy2 = self.rim_zone
+            cv2.rectangle(frame, (int(zx1), int(zy1)), (int(zx2), int(zy2)), (0, 255, 255), 2)
+        
+        if self.goal_zone:
+            zx1, zy1, zx2, zy2 = self.goal_zone
+            cv2.rectangle(frame, (int(zx1), int(zy1)), (int(zx2), int(zy2)), (0, 255, 0), 2)
+            cv2.putText(frame, "GOAL", (int(zx1), int(zy1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
         # 画最近轨迹
         pts = self.tracker.get_recent_positions(15)
         for i in range(1, len(pts)):
