@@ -1,25 +1,16 @@
 """
 detector.py
 进球检测模块 — 野球场版本
-核心逻辑：篮球轨迹 + 篮筐区域穿越 + 球网像素变化
+核心逻辑：篮球轨迹 + 篮筐区域穿越
 """
 import cv2
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
-from enum import Enum
 import logging
 from app.core.yolo_detector import YOLOSportsDetector
 
 logger = logging.getLogger(__name__)
-
-
-class GoalState(Enum):
-    WAITING = 0
-    IN_HIGH_ZONE = 1
-    TOUCHING_RIM = 2
-    IN_GOAL_ZONE = 3
-    CONFIRMED = 4
 
 
 @dataclass
@@ -32,7 +23,6 @@ class DetectionConfig:
     trajectory_min_frames: int = 3      # 判断轨迹所需最少帧数
     goal_cooldown: float = 5.0          # 两次进球最短间隔(秒), 防止重复
     sample_every_n: int = 1             # 每N帧处理一次，加快速度
-    min_frames_in_goal_zone: int = 2    # 进球区内最少停留帧数才确认进球
     # 篮筐检测参数
     canny_low_threshold: int = 40       # Canny边缘检测低阈值
     canny_high_threshold: int = 120     # Canny边缘检测高阈值
@@ -47,17 +37,12 @@ class DetectionConfig:
     hoop_history_size: int = 10         # 篮筐位置历史大小
     hoop_stability_threshold: int = 3    # 篮筐位置稳定阈值
     # 三阶段区域判定参数
-    high_zone_offset: float = 100.0     # 高位区偏移(像素)
-    goal_zone_offset: float = 100.0      # 进球区偏移(像素)
-    shot_window: float = 1.5             # 时间窗口(秒)
-    # 轨迹验证参数
-    trajectory_validation_frames_min: int = 5  # 轨迹验证最小帧数
-    trajectory_validation_frames_max: int = 10  # 轨迹验证最大帧数
-    required_slope_threshold: float = 0.3       # 最小下降斜率
-    lateral_tolerance_ratio: float = 2.0         # 横向容忍度（篮筐半径的倍数）
+    high_zone_offset: float = 150.0     # 高位区偏移(像素)
+    goal_zone_offset: float = 150.0      # 进球区偏移(像素)
+    shot_window: float = 2.5             # 时间窗口(秒)
     # 篮筐校准参数
     calibration_samples: int = 30         # 校准样本数
-    # YOLO检测参数（暂时禁用）
+    # YOLO检测参数
     use_yolo: bool = False              # 是否使用YOLO检测
     yolo_model_path: str = "yolo11n.pt"  # YOLO模型路径
     yolo_conf_thres: float = 0.25       # YOLO置信度阈值
@@ -364,8 +349,10 @@ class BallTracker:
 
 class GoalDetector:
     """
-    进球检测：采用griftt/ball-yolo的三阶段区域判定法 + 状态机
-    状态顺序：WAITING -> IN_HIGH_ZONE -> TOUCHING_RIM -> IN_GOAL_ZONE -> CONFIRMED
+    进球检测：采用griftt/ball-yolo的三阶段区域判定法
+    1. 高位区 - 篮球在篮筐上方
+    2. 触框区 - 篮球与篮筐重叠
+    3. 进球区 - 篮球穿过篮筐下方
     """
 
     def __init__(self, config: DetectionConfig):
@@ -377,10 +364,9 @@ class GoalDetector:
         self.frame_count = 0
         self.ball_detected_count = 0
         
-        # 状态机
-        self.current_state: GoalState = GoalState.WAITING
-        self.state_entry_time: float = 0.0
-        self.STATE_TIMEOUT: float = 3.0  # 状态超时时间（秒）
+        # 三阶段判定状态
+        self.last_high_zone_ts: float = -999.0
+        self.last_rim_touch_ts: float = -999.0
         
         # 篮筐校准
         self.calibration_buffer: list = []
@@ -391,10 +377,6 @@ class GoalDetector:
         self.high_zone: Optional[tuple] = None
         self.rim_zone: Optional[tuple] = None
         self.goal_zone: Optional[tuple] = None
-        
-        # 进球确认追踪
-        self.frames_in_goal_zone: int = 0  # 进球区内连续帧数
-        self.last_in_goal_frame: int = -1  # 上次在进球区的帧索引
         
         # YOLO检测相关
         self.yolo_detector = None
@@ -458,117 +440,6 @@ class GoalDetector:
     
     def _is_in_goal_zone(self, ball: BallDetection) -> bool:
         return self._is_in_zone(ball, self.goal_zone)
-    
-    def _reset_state(self):
-        """重置所有状态到WAITING"""
-        logger.debug("🔄 完整状态重置")
-        self.current_state = GoalState.WAITING
-        self.state_entry_time = 0.0
-        self.frames_in_goal_zone = 0
-        self.last_in_goal_frame = -1
-    
-    def _transition_to(self, new_state: GoalState, timestamp: float, ball: Optional[BallDetection] = None):
-        """转换到新状态，记录详细信息"""
-        if self.current_state != new_state:
-            log_msg = f"🔄 状态转换: {self.current_state.name} -> {new_state.name} at {timestamp:.1f}s"
-            if ball:
-                log_msg += f" | 篮球位置: ({ball.cx:.0f}, {ball.cy:.0f})"
-            logger.debug(log_msg)
-            self.current_state = new_state
-            self.state_entry_time = timestamp
-    
-    def _check_state_timeout(self, timestamp: float) -> bool:
-        """检查是否超时，超时返回True并重置状态"""
-        if self.current_state == GoalState.WAITING:
-            return False
-        
-        time_in_state = timestamp - self.state_entry_time
-        if time_in_state > self.STATE_TIMEOUT:
-            logger.debug(f"⏱️  状态超时: {self.current_state.name} after {time_in_state:.1f}s")
-            self._reset_state()
-            return True
-        return False
-
-    def _validate_trajectory(self) -> bool:
-        """
-        验证最近10-15帧篮球轨迹的连续性和有效性
-        返回True表示轨迹验证通过
-        详细记录所有关键数据和决策原因
-        """
-        if not self.locked_hoop_rect:
-            logger.debug("❌ 轨迹验证失败：篮筐位置未锁定")
-            return False
-
-        # 获取最近的轨迹点
-        n_frames = min(len(self.tracker.history), self.config.trajectory_validation_frames_max)
-        if n_frames < self.config.trajectory_validation_frames_min:
-            logger.debug(f"❌ 轨迹验证失败：轨迹点不足，当前{len(self.tracker.history)}个，需要至少{self.config.trajectory_validation_frames_min}个")
-            return False
-
-        recent_positions = self.tracker.history[-n_frames:]
-        logger.debug(f"📈 开始轨迹验证，使用最近{len(recent_positions)}个轨迹点")
-
-        # 提取篮筐信息
-        hx, hy, hw, hh = self.locked_hoop_rect
-        hoop_cx = hx + hw // 2
-        hoop_cy = hy + hh // 2
-        hoop_r = hw // 2
-        logger.debug(f"📊 篮筐信息: 中心({hoop_cx}, {hoop_cy}), 半径{hoop_r}")
-
-        # 验证1：计算y坐标的下降趋势（线性回归斜率）
-        ys = [pos.cy for pos in recent_positions]
-        xs = list(range(len(ys)))
-        
-        # 线性回归计算斜率
-        n = len(xs)
-        sum_x = sum(xs)
-        sum_y = sum(ys)
-        sum_xy = sum(x * y for x, y in zip(xs, ys))
-        sum_x2 = sum(x * x for x in xs)
-        
-        if n * sum_x2 - sum_x ** 2 == 0:
-            logger.debug("❌ 轨迹验证失败：无法计算斜率，x值完全相同")
-            return False
-        
-        slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x ** 2)
-        
-        # 斜率应为正（y坐标向下增加），表示下降趋势
-        logger.debug(f"📈 轨迹分析：下降斜率{slope:.2f}，阈值{self.config.required_slope_threshold:.2f}")
-        if slope < self.config.required_slope_threshold:
-            logger.debug(f"❌ 轨迹验证失败：下降斜率不足，当前{slope:.2f} < 阈值{self.config.required_slope_threshold:.2f}")
-            return False
-        logger.debug(f"✅ 轨迹验证：下降斜率{slope:.2f}，符合要求")
-
-        # 验证2：轨迹是从高位区向下移动到进球区
-        first_pos = recent_positions[0]
-        last_pos = recent_positions[-1]
-        logger.debug(f"📍 起始位置: ({first_pos.cx:.0f}, {first_pos.cy:.0f}), 结束位置: ({last_pos.cx:.0f}, {last_pos.cy:.0f}), 篮筐y: {hoop_cy}")
-        
-        # 检查起始位置在高位区或上方
-        if not (first_pos.cy < hoop_cy):
-            logger.debug(f"❌ 轨迹验证失败：起始位置y={first_pos.cy:.0f} 不在篮筐上方(y<{hoop_cy})")
-            return False
-        
-        # 检查结束位置在篮筐下方
-        if not (last_pos.cy > hoop_cy):
-            logger.debug(f"❌ 轨迹验证失败：结束位置y={last_pos.cy:.0f} 不在篮筐下方(y>{hoop_cy})")
-            return False
-        logger.debug("✅ 轨迹验证：从上方到下方的移动轨迹符合要求")
-
-        # 验证3：横向位置不偏离篮筐太远
-        lateral_tolerance = hoop_r * self.config.lateral_tolerance_ratio
-        max_dx = 0.0
-        for pos in recent_positions:
-            dx = abs(pos.cx - hoop_cx)
-            if dx > max_dx:
-                max_dx = dx
-            if dx > lateral_tolerance:
-                logger.debug(f"❌ 轨迹验证失败：点({pos.cx:.0f}, {pos.cy:.0f}) 横向偏离{dx:.0f}像素，最大允许{lateral_tolerance:.0f}像素")
-                return False
-        logger.debug(f"✅ 轨迹验证：横向位置在允许范围内（最大偏离{max_dx:.0f}像素，允许±{lateral_tolerance:.0f}像素）")
-
-        logger.debug("✅ 轨迹验证通过！所有条件均满足")
-        return True
 
     def _calibrate_hoop(self, frame: np.ndarray, config: DetectionConfig, frame_idx: int):
         """篮筐位置校准"""
@@ -608,7 +479,6 @@ class GoalDetector:
     def process_frame(self, frame: np.ndarray, frame_idx: int, timestamp: float) -> bool:
         """
         处理单帧，返回是否检测到进球
-        使用状态机：WAITING -> IN_HIGH_ZONE -> TOUCHING_RIM -> IN_GOAL_ZONE -> CONFIRMED
         """
         self.frame_count += 1
         config = self.config
@@ -620,9 +490,6 @@ class GoalDetector:
                 if self.frame_count % 50 == 0:
                     logger.debug(f"⏳ 正在校准篮筐位置... ({len(self.calibration_buffer)}/{config.calibration_samples})")
                 return False
-
-        # 检查状态超时
-        self._check_state_timeout(timestamp)
 
         # 检测篮球
         ball = None
@@ -649,128 +516,57 @@ class GoalDetector:
                     logger.debug(f"🏀 传统篮球检测: 位置({ball.cx:.0f}, {ball.cy:.0f}), 半径{ball.radius:.0f}")
         
         if ball:
-            # 状态机转换逻辑
-            goal_detected = self._update_state_machine(ball, timestamp, config)
-            if goal_detected:
-                return True
-
-        return False
-    
-    def _update_state_machine(self, ball: BallDetection, timestamp: float, config: DetectionConfig) -> bool:
-        """
-        更新状态机并返回是否检测到进球
-        优化版：多重条件验证 + 进球区停留帧数要求
-        """
-        # 冷却时间检查
-        if timestamp - self.last_goal_time < config.goal_cooldown:
-            if self.ball_detected_count % 30 == 0:
-                logger.debug(f"⏸️  冷却中: 距离上次进球 {timestamp - self.last_goal_time:.1f}s, 需要 {config.goal_cooldown:.1f}s")
-            return False
-        
-        in_high = self._is_in_high_zone(ball)
-        on_rim = self._is_touching_rim(ball)
-        in_goal = self._is_in_goal_zone(ball)
-        
-        logger.debug(f"📍 状态: {self.current_state.name} | 高位区: {in_high} | 篮筐区: {on_rim} | 进球区: {in_goal} | 位置: ({ball.cx:.0f}, {ball.cy:.0f})")
-        
-        # 状态转换
-        if self.current_state == GoalState.WAITING:
-            if in_high:
-                self._transition_to(GoalState.IN_HIGH_ZONE, timestamp, ball)
+            # 检查是否在高位区
+            if self._is_in_high_zone(ball):
+                self.last_high_zone_ts = timestamp
                 logger.debug(f"📍 篮球进入高位区: {timestamp:.1f}s")
-        
-        elif self.current_state == GoalState.IN_HIGH_ZONE:
-            if on_rim:
-                self._transition_to(GoalState.TOUCHING_RIM, timestamp, ball)
+            
+            # 检查是否触框
+            if self._is_touching_rim(ball):
+                self.last_rim_touch_ts = timestamp
                 logger.debug(f"🎯 篮球触框: {timestamp:.1f}s")
-            elif in_goal:
-                self._transition_to(GoalState.IN_GOAL_ZONE, timestamp, ball)
-                self.frames_in_goal_zone = 1
-                self.last_in_goal_frame = ball.frame_idx
-                logger.debug(f"⬇️  篮球进入进球区 (第1帧): {timestamp:.1f}s")
-        
-        elif self.current_state == GoalState.TOUCHING_RIM:
-            if in_goal:
-                self._transition_to(GoalState.IN_GOAL_ZONE, timestamp, ball)
-                self.frames_in_goal_zone = 1
-                self.last_in_goal_frame = ball.frame_idx
-                logger.debug(f"⬇️  篮球从篮筐区进入进球区 (第1帧): {timestamp:.1f}s")
-        
-        elif self.current_state == GoalState.IN_GOAL_ZONE:
-            if in_goal:
-                # 检查是否是连续的帧
-                if ball.frame_idx - self.last_in_goal_frame <= 2:
-                    self.frames_in_goal_zone += 1
-                    self.last_in_goal_frame = ball.frame_idx
-                    logger.debug(f"📊 进球区内连续帧数: {self.frames_in_goal_zone}/{config.min_frames_in_goal_zone}")
-                    
-                    # 检查是否满足停留帧数要求
-                    if self.frames_in_goal_zone >= config.min_frames_in_goal_zone:
-                        # 多重条件验证
-                        validation_results = {}
-                        
-                        # 验证1: 轨迹验证
-                        validation_results['trajectory'] = self._validate_trajectory()
-                        
-                        # 验证2: 篮筐位置已校准
-                        validation_results['calibrated'] = self.is_calibrated and self.locked_hoop_rect is not None
-                        
-                        # 验证3: 篮球大小合理
-                        validation_results['ball_size'] = config.min_ball_radius <= ball.radius <= config.max_ball_radius
-                        
-                        # 记录所有验证结果
-                        logger.debug(f"🔍 多重条件验证结果: {validation_results}")
-                        
-                        # 检查所有验证条件是否通过
-                        all_validated = all(validation_results.values())
-                        
-                        if all_validated:
-                            self._transition_to(GoalState.CONFIRMED, timestamp, ball)
-                            logger.info(f"✅ 进球检测成功！时间戳 {timestamp:.1f}s | 进球区停留 {self.frames_in_goal_zone} 帧")
-                            self.last_goal_time = timestamp
-                            self._reset_state()
-                            return True
-                        else:
-                            failed_checks = [k for k, v in validation_results.items() if not v]
-                            logger.debug(f"❌ 多重条件验证失败，未通过项: {failed_checks}，不确认进球")
-                            self._reset_state()
-                else:
-                    # 帧不连续，重置计数
-                    logger.debug(f"⏭️  进球区检测中断，帧不连续，重置计数")
-                    self.frames_in_goal_zone = 1
-                    self.last_in_goal_frame = ball.frame_idx
-            else:
-                # 离开了进球区
-                logger.debug(f"🏃 篮球离开了进球区，重置状态")
-                self._reset_state()
-        
+            
+            # 检查是否在进球区
+            if self._is_in_goal_zone(ball):
+                logger.debug(f"⬇️  篮球进入进球区: {timestamp:.1f}s")
+                
+                # 检查时间窗口
+                last_interaction = max(self.last_high_zone_ts, self.last_rim_touch_ts)
+                time_diff = timestamp - last_interaction
+                
+                # 冷却时间检查
+                if timestamp - self.last_goal_time < config.goal_cooldown:
+                    return False
+                
+                # 检查是否在合理的时间窗口内
+                if 0.05 < time_diff < config.shot_window:
+                    logger.info(f"✅ 进球检测成功！时间戳 {timestamp:.1f}s, 时间差 {time_diff:.2f}s")
+                    self.last_goal_time = timestamp
+                    # 重置状态
+                    self.last_high_zone_ts = -999.0
+                    self.last_rim_touch_ts = -999.0
+                    return True
+
         return False
 
     def draw_debug(self, frame: np.ndarray) -> np.ndarray:
-        """在帧上绘制调试信息，包括三阶段区域和当前状态"""
+        """在帧上绘制调试信息，包括三阶段区域"""
         frame = self.hoop.draw(frame)
         
         # 绘制三阶段区域
         if self.high_zone:
             zx1, zy1, zx2, zy2 = self.high_zone
-            color = (255, 255, 0) if self.current_state == GoalState.IN_HIGH_ZONE else (100, 100, 0)
-            cv2.rectangle(frame, (int(zx1), int(zy1)), (int(zx2), int(zy2)), color, 2)
-            cv2.putText(frame, "HIGH", (int(zx1), int(zy1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            cv2.rectangle(frame, (int(zx1), int(zy1)), (int(zx2), int(zy2)), (255, 255, 0), 2)
+            cv2.putText(frame, "HIGH", (int(zx1), int(zy1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
         
         if self.rim_zone:
             zx1, zy1, zx2, zy2 = self.rim_zone
-            color = (0, 255, 255) if self.current_state == GoalState.TOUCHING_RIM else (0, 100, 100)
-            cv2.rectangle(frame, (int(zx1), int(zy1)), (int(zx2), int(zy2)), color, 2)
+            cv2.rectangle(frame, (int(zx1), int(zy1)), (int(zx2), int(zy2)), (0, 255, 255), 2)
         
         if self.goal_zone:
             zx1, zy1, zx2, zy2 = self.goal_zone
-            color = (0, 255, 0) if self.current_state == GoalState.IN_GOAL_ZONE else (0, 100, 0)
-            cv2.rectangle(frame, (int(zx1), int(zy1)), (int(zx2), int(zy2)), color, 2)
-            cv2.putText(frame, "GOAL", (int(zx1), int(zy1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        
-        # 显示当前状态
-        state_text = f"State: {self.current_state.name}"
-        cv2.putText(frame, state_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+            cv2.rectangle(frame, (int(zx1), int(zy1)), (int(zx2), int(zy2)), (0, 255, 0), 2)
+            cv2.putText(frame, "GOAL", (int(zx1), int(zy1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         
         # 画最近轨迹
         pts = self.tracker.get_recent_positions(15)
