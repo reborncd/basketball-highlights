@@ -43,6 +43,10 @@ class Project:
     clips: list[GoalClip] = field(default_factory=list)
     players: list[Player] = field(default_factory=list)
     detection_done: bool = False
+    manual_hoop_rect: Optional[tuple[int, int, int, int]] = None
+    last_detection_stats: dict = field(default_factory=dict)
+    last_detection_failure_reason: Optional[str] = None
+    last_detection_config: dict = field(default_factory=dict)
 
     # ── 持久化 ──────────────────────────────────────────────
     def save(self):
@@ -51,6 +55,10 @@ class Project:
             "video_path": self.video_path,
             "project_dir": self.project_dir,
             "detection_done": self.detection_done,
+            "manual_hoop_rect": list(self.manual_hoop_rect) if self.manual_hoop_rect else None,
+            "last_detection_stats": self.last_detection_stats,
+            "last_detection_failure_reason": self.last_detection_failure_reason,
+            "last_detection_config": self.last_detection_config,
             "clips": [asdict(c) for c in self.clips],
             "players": [asdict(p) for p in self.players],
         }
@@ -67,6 +75,10 @@ class Project:
             video_path=data["video_path"],
             project_dir=data["project_dir"],
             detection_done=data.get("detection_done", False),
+            manual_hoop_rect=tuple(data["manual_hoop_rect"]) if data.get("manual_hoop_rect") else None,
+            last_detection_stats=data.get("last_detection_stats", {}),
+            last_detection_failure_reason=data.get("last_detection_failure_reason"),
+            last_detection_config=data.get("last_detection_config", {}),
         )
         proj.clips = [GoalClip(**c) for c in data.get("clips", [])]
         proj.players = [Player(**p) for p in data.get("players", [])]

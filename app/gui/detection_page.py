@@ -2,27 +2,180 @@
 detection_page.py
 第①页：导入视频 + 自动检测进球 + 手动补充/删除
 """
-import threading
 import os
-from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QProgressBar, QListWidget, QListWidgetItem, QDoubleSpinBox,
-    QGroupBox, QFormLayout, QSplitter, QSpinBox, QMessageBox,
-    QInputDialog, QFrame, QCheckBox, QLineEdit
-)
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QColor
+import threading
 
-from app.core.project import Project, GoalClip
-from app.core.detector import DetectionConfig, run_detection
-from app.core.clipper import extract_thumbnail, get_video_info
+from PyQt5.QtCore import QPoint, QRect, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PyQt5.QtWidgets import (
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QPushButton,
+    QProgressBar,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from app.core.clipper import get_video_info
+from app.core.detector import (
+    DetectionConfig,
+    DetectionRunResult,
+    describe_failure_reason,
+    run_detection,
+)
+from app.core.project import Project
+
+
+class RectSelectionLabel(QLabel):
+    """在静态预览图上框选矩形区域"""
+
+    def __init__(self, pixmap: QPixmap, parent=None):
+        super().__init__(parent)
+        self._base_pixmap = pixmap
+        self._selection = QRect()
+        self._drag_start: QPoint | None = None
+        self.setFixedSize(self._base_pixmap.size())
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self._update_preview()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start = event.pos()
+            self._selection = QRect(self._drag_start, self._drag_start)
+            self._update_preview()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_start is not None:
+            self._selection = QRect(self._drag_start, event.pos()).normalized()
+            self._update_preview()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
+            self._selection = QRect(self._drag_start, event.pos()).normalized()
+            self._drag_start = None
+            self._update_preview()
+        super().mouseReleaseEvent(event)
+
+    def set_selection(self, rect: QRect):
+        self._selection = rect.normalized()
+        self._update_preview()
+
+    def clear_selection(self):
+        self._selection = QRect()
+        self._update_preview()
+
+    def selected_rect(self) -> QRect:
+        return self._selection.normalized()
+
+    def has_selection(self) -> bool:
+        rect = self.selected_rect()
+        return rect.width() > 4 and rect.height() > 4
+
+    def _update_preview(self):
+        preview = QPixmap(self._base_pixmap)
+        if self.has_selection():
+            painter = QPainter(preview)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(QPen(QColor("#27AE60"), 2))
+            painter.fillRect(self._selection, QColor(39, 174, 96, 70))
+            painter.drawRect(self._selection)
+            painter.end()
+        self.setPixmap(preview)
+
+
+class HoopCalibrationDialog(QDialog):
+    """基于首帧手动框选篮筐"""
+
+    def __init__(self, image: QImage, initial_rect=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("手动标定篮筐")
+        self._image = image
+        self._initial_rect = initial_rect
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("请在首帧上框出篮筐区域，尽量只圈住篮筐和少量边缘。"))
+
+        preview = self._build_preview_pixmap()
+        self._scale_x = self._image.width() / max(1, preview.width())
+        self._scale_y = self._image.height() / max(1, preview.height())
+        self.selector = RectSelectionLabel(preview, self)
+        layout.addWidget(self.selector, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        if self._initial_rect:
+            x, y, w, h = self._initial_rect
+            scaled_rect = QRect(
+                int(x / self._scale_x),
+                int(y / self._scale_y),
+                int(w / self._scale_x),
+                int(h / self._scale_y),
+            )
+            self.selector.set_selection(scaled_rect)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        clear_btn = QPushButton("清除选择")
+        clear_btn.clicked.connect(self.selector.clear_selection)
+        buttons.addButton(clear_btn, QDialogButtonBox.ButtonRole.ResetRole)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _build_preview_pixmap(self) -> QPixmap:
+        max_w = 960
+        max_h = 540
+        preview = self._image
+        if self._image.width() > max_w or self._image.height() > max_h:
+            preview = self._image.scaled(
+                max_w,
+                max_h,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        return QPixmap.fromImage(preview)
+
+    def accept(self):
+        if not self.selector.has_selection():
+            QMessageBox.warning(self, "提示", "请先框选篮筐区域")
+            return
+        super().accept()
+
+    def selected_rect(self):
+        if not self.selector.has_selection():
+            return None
+
+        rect = self.selector.selected_rect()
+        x = int(round(rect.x() * self._scale_x))
+        y = int(round(rect.y() * self._scale_y))
+        w = int(round(rect.width() * self._scale_x))
+        h = int(round(rect.height() * self._scale_y))
+        x = max(0, min(x, self._image.width() - 1))
+        y = max(0, min(y, self._image.height() - 1))
+        w = max(1, min(w, self._image.width() - x))
+        h = max(1, min(h, self._image.height() - y))
+        return (x, y, w, h)
 
 
 class DetectionPage(QWidget):
-    detection_finished = pyqtSignal(object)   # 发出 Project
-    _detection_done_signal = pyqtSignal(object, object)  # 用于在主线程中更新UI
-    _detection_error_signal = pyqtSignal(str)  # 用于在主线程中显示错误
-    _log_signal = pyqtSignal(str)  # 用于在主线程中添加日志
+    detection_finished = pyqtSignal(object)
+    _detection_done_signal = pyqtSignal(object, object)
+    _detection_error_signal = pyqtSignal(str)
+    _log_signal = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -31,6 +184,7 @@ class DetectionPage(QWidget):
         self._detection_thread: threading.Thread | None = None
         self._progress_val = 0
         self._progress_total = 1
+        self._is_detecting = False
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._update_progress_ui)
         self._timer.start(200)
@@ -44,12 +198,11 @@ class DetectionPage(QWidget):
         root.setSpacing(10)
         root.setContentsMargins(16, 16, 16, 16)
 
-        # ── 顶部：视频信息 ───────────────────────────────────
         info_row = QHBoxLayout()
         self.lbl_video = QLabel("未加载视频")
         self.lbl_video.setStyleSheet("font-size:13px; color:#555;")
         info_row.addWidget(self.lbl_video)
-        
+
         self.btn_select_video = QPushButton("📁 选择视频")
         self.btn_select_video.setStyleSheet(
             "QPushButton{background:#27AE60;color:white;border-radius:5px;padding:4px 12px;}"
@@ -57,11 +210,9 @@ class DetectionPage(QWidget):
         )
         self.btn_select_video.clicked.connect(self.select_video)
         info_row.addWidget(self.btn_select_video)
-        
         info_row.addStretch()
         root.addLayout(info_row)
 
-        # ── 参数设置 ─────────────────────────────────────────
         cfg_box = QGroupBox("检测参数")
         cfg_form = QFormLayout(cfg_box)
 
@@ -79,12 +230,11 @@ class DetectionPage(QWidget):
 
         self.spin_sample = QSpinBox()
         self.spin_sample.setRange(1, 5)
-        self.spin_sample.setValue(2)
+        self.spin_sample.setValue(1)
         self.spin_sample.setSuffix(" (每N帧处理1次)")
         cfg_form.addRow("跳帧加速:", self.spin_sample)
 
-        # YOLO检测配置
-        self.chk_use_yolo = QCheckBox("启用YOLO深度学习检测")
+        self.chk_use_yolo = QCheckBox("启用YOLO辅助篮球检测")
         self.chk_use_yolo.setChecked(False)
         cfg_form.addRow("", self.chk_use_yolo)
 
@@ -93,9 +243,26 @@ class DetectionPage(QWidget):
         self.txt_yolo_model.setPlaceholderText("YOLO模型路径")
         cfg_form.addRow("YOLO模型:", self.txt_yolo_model)
 
+        hoop_row = QWidget()
+        hoop_layout = QHBoxLayout(hoop_row)
+        hoop_layout.setContentsMargins(0, 0, 0, 0)
+        hoop_layout.setSpacing(6)
+        self.btn_calibrate_hoop = QPushButton("🎯 标定篮筐")
+        self.btn_calibrate_hoop.clicked.connect(self.calibrate_hoop)
+        hoop_layout.addWidget(self.btn_calibrate_hoop)
+        self.btn_clear_hoop = QPushButton("清除标定")
+        self.btn_clear_hoop.clicked.connect(self.clear_manual_hoop)
+        hoop_layout.addWidget(self.btn_clear_hoop)
+        hoop_layout.addStretch()
+        cfg_form.addRow("篮筐标定:", hoop_row)
+
+        self.lbl_hoop_status = QLabel("当前：未手动标定，将使用自动校准")
+        self.lbl_hoop_status.setStyleSheet("color:#555; font-size:12px;")
+        self.lbl_hoop_status.setWordWrap(True)
+        cfg_form.addRow("", self.lbl_hoop_status)
+
         root.addWidget(cfg_box)
 
-        # ── 检测按钮 + 进度 ──────────────────────────────────
         btn_row = QHBoxLayout()
         self.btn_detect = QPushButton("🔍  开始自动检测")
         self.btn_detect.setFixedHeight(40)
@@ -124,29 +291,29 @@ class DetectionPage(QWidget):
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self.lbl_status)
 
-        # ── 分隔线 ──────────────────────────────────────────
+        self.lbl_last_summary = QLabel("上次检测：—")
+        self.lbl_last_summary.setWordWrap(True)
+        self.lbl_last_summary.setStyleSheet("color:#555; font-size:12px;")
+        root.addWidget(self.lbl_last_summary)
+
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setFrameShadow(QFrame.Shadow.Sunken)
         root.addWidget(line)
 
-        # ── 日志展示区域 ────────────────────────────────────
         log_group = QGroupBox("检测日志")
         log_layout = QVBoxLayout(log_group)
-        
         self.log_list = QListWidget()
         self.log_list.setAlternatingRowColors(True)
         self.log_list.setStyleSheet("font-size:12px;")
         log_layout.addWidget(self.log_list)
         root.addWidget(log_group)
 
-        # ── 分隔线 ──────────────────────────────────────────
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setFrameShadow(QFrame.Shadow.Sunken)
         root.addWidget(line)
 
-        # ── 进球列表 + 手动操作 ──────────────────────────────
         list_label = QLabel("进球片段列表（可手动添加/删除）")
         list_label.setStyleSheet("font-weight:bold;")
         root.addWidget(list_label)
@@ -163,7 +330,6 @@ class DetectionPage(QWidget):
         self.btn_delete = QPushButton("✕ 删除选中")
         self.btn_delete.clicked.connect(self.delete_selected)
         manual_row.addWidget(self.btn_delete)
-
         manual_row.addStretch()
 
         self.btn_next = QPushButton("下一步：分配球员 ▶")
@@ -176,10 +342,8 @@ class DetectionPage(QWidget):
         self.btn_next.setEnabled(False)
         self.btn_next.clicked.connect(self.finish_detection)
         manual_row.addWidget(self.btn_next)
-
         root.addLayout(manual_row)
 
-    # ── 外部调用 ─────────────────────────────────────────────
     def load_project(self, project: Project):
         self.project = project
         info = get_video_info(project.video_path)
@@ -188,83 +352,79 @@ class DetectionPage(QWidget):
             dur = info.get("duration", 0)
             fps = info.get("fps", 0)
             w, h = info.get("width", 0), info.get("height", 0)
-            self.lbl_video.setText(
-                f"{name}  |  {dur:.0f}s  |  {fps:.1f}fps  |  {w}×{h}"
-            )
+            self.lbl_video.setText(f"{name}  |  {dur:.0f}s  |  {fps:.1f}fps  |  {w}×{h}")
         else:
             self.lbl_video.setText(name)
+        self._update_hoop_status()
+        self._update_last_summary()
         self._refresh_list()
 
-    # ── 检测逻辑 ─────────────────────────────────────────────
     def start_detection(self):
         if not self.project:
             QMessageBox.warning(self, "提示", "请先新建项目并选择视频")
             return
+
         self._cancel_flag.clear()
+        self._is_detecting = True
         self.btn_detect.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.progress.setValue(0)
         self.lbl_status.setText("正在检测…")
-        self.log_list.clear()  # 清空日志
+        self.log_list.clear()
 
         config = DetectionConfig(
             pre_roll=self.spin_pre.value(),
             post_roll=self.spin_post.value(),
             sample_every_n=self.spin_sample.value(),
             use_yolo=self.chk_use_yolo.isChecked(),
-            yolo_model_path=self.txt_yolo_model.text(),
+            yolo_model_path=self.txt_yolo_model.text().strip() or "yolo11n.pt",
+            manual_hoop_rect=self.project.manual_hoop_rect,
         )
 
         def worker():
+            import logging
+
+            class QtLogHandler(logging.Handler):
+                def __init__(self, signal):
+                    super().__init__()
+                    self.signal = signal
+
+                def emit(self, record):
+                    self.signal.emit(self.format(record))
+
+            qt_handler = QtLogHandler(self._log_signal)
+            qt_handler.setLevel(logging.INFO)
+            qt_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+            detector_logger = logging.getLogger("app.core.detector")
+            yolo_logger = logging.getLogger("app.core.yolo_detector")
+            detector_logger.addHandler(qt_handler)
+            yolo_logger.addHandler(qt_handler)
             try:
-                # 创建一个自定义的Handler来直接发送日志
-                import logging
-                class QtLogHandler(logging.Handler):
-                    def __init__(self, signal):
-                        super().__init__()
-                        self.signal = signal
-                    def emit(self, record):
-                        msg = self.format(record)
-                        self.signal.emit(msg)
-                
-                # 获取detector模块的logger
-                detector_logger = logging.getLogger('app.core.detector')
-                # 添加自定义handler
-                qt_handler = QtLogHandler(self._log_signal)
-                qt_handler.setLevel(logging.INFO)
-                formatter = logging.Formatter('%(asctime)s - %(message)s')
-                qt_handler.setFormatter(formatter)
-                detector_logger.addHandler(qt_handler)
-                
-                timestamps = run_detection(
+                result = run_detection(
                     self.project.video_path,
                     config,
                     progress_callback=self._on_progress,
                     cancel_flag=self._cancel_flag,
                 )
-                
-                # 移除handler
-                detector_logger.removeHandler(qt_handler)
-                
-                self._on_detection_done(timestamps, config)
+                self._on_detection_done(result, config)
             except Exception as e:
                 self._on_detection_error(str(e))
+            finally:
+                detector_logger.removeHandler(qt_handler)
+                yolo_logger.removeHandler(qt_handler)
 
         self._detection_thread = threading.Thread(target=worker, daemon=True)
         self._detection_thread.start()
 
-    def _add_log_message(self, message):
-        """添加日志消息到日志列表"""
+    def _add_log_message(self, message: str):
         item = QListWidgetItem(message)
-        # 根据消息内容设置不同的颜色
-        if "✅ 进球检测" in message:
-            item.setForeground(QColor(46, 204, 113))  # 绿色
-        elif "⚠️ 进球检测" in message:
-            item.setForeground(QColor(241, 196, 15))  # 黄色
-        elif "检测完成" in message:
-            item.setForeground(QColor(52, 152, 219))  # 蓝色
+        if "✅ 进球检测" in message or "✅ 篮筐锁定完成" in message:
+            item.setForeground(QColor(46, 204, 113))
+        elif "⚠️" in message:
+            item.setForeground(QColor(241, 196, 15))
+        elif "检测摘要" in message:
+            item.setForeground(QColor(52, 152, 219))
         self.log_list.addItem(item)
-        # 自动滚动到底部
         self.log_list.scrollToBottom()
 
     def cancel_detection(self):
@@ -273,56 +433,152 @@ class DetectionPage(QWidget):
 
     def _on_progress(self, current, total):
         self._progress_val = current
-        self._progress_total = total
+        self._progress_total = max(1, total)
 
     def _update_progress_ui(self):
-        if self._progress_total > 0:
-            pct = int(self._progress_val / self._progress_total * 100)
-            self.progress.setValue(pct)
-            self.lbl_status.setText(
-                f"分析帧 {self._progress_val} / {self._progress_total}  ({pct}%)"
-            )
+        if not self._is_detecting:
+            return
+        pct = int(self._progress_val / self._progress_total * 100)
+        self.progress.setValue(pct)
+        self.lbl_status.setText(f"分析帧 {self._progress_val} / {self._progress_total}  ({pct}%)")
 
-    def _on_detection_done(self, timestamps: list[float], config: DetectionConfig):
-        print(f"_on_detection_done 被调用，找到 {len(timestamps)} 个进球")
-        # 通过信号在主线程中更新UI
-        self._detection_done_signal.emit(timestamps, config)
+    def _on_detection_done(self, result: DetectionRunResult, config: DetectionConfig):
+        self._detection_done_signal.emit(result, config)
 
-    def _on_detection_done_main_thread(self, timestamps: list[float], config: DetectionConfig):
-        print(f"_on_detection_done_main_thread 被调用，找到 {len(timestamps)} 个进球")
-        # 在主线程中更新UI
+    def _on_detection_done_main_thread(self, result: DetectionRunResult, config: DetectionConfig):
+        if not self.project:
+            return
+
+        self._is_detecting = False
         self.btn_detect.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         self.progress.setValue(100)
-        # 清空旧片段，重新添加
+
         self.project.clips.clear()
-        for ts in timestamps:
+        for ts in result.timestamps:
             self.project.add_goal(ts, config.pre_roll, config.post_roll)
         self.project.detection_done = True
+        self.project.last_detection_stats = result.stats
+        self.project.last_detection_failure_reason = result.failure_reason
+        self.project.last_detection_config = result.config_snapshot
         self.project.save()
+
         self._refresh_list()
-        self.lbl_status.setText(f"✅ 检测完成，共找到 {len(timestamps)} 个进球")
-        self.btn_next.setEnabled(True)
+        self._update_last_summary()
+
+        if result.failure_reason == "cancelled":
+            self.lbl_status.setText("⏹️ 检测已取消")
+            self.btn_next.setEnabled(bool(self.project.clips))
+            return
+
+        if result.timestamps:
+            self.lbl_status.setText(f"✅ 检测完成，共找到 {len(result.timestamps)} 个候选进球")
+            self.btn_next.setEnabled(True)
+            return
+
+        failure_text = describe_failure_reason(result.failure_reason)
+        self.lbl_status.setText(f"⚠️ 未检测到候选进球：{failure_text}")
+        self.btn_next.setEnabled(False)
+        QMessageBox.information(
+            self,
+            "未检测到候选进球",
+            f"{failure_text}\n\n{result.summary}",
+        )
 
     def _on_detection_error(self, msg: str):
-        print(f"_on_detection_error 被调用，错误信息: {msg}")
-        # 通过信号在主线程中更新UI
         self._detection_error_signal.emit(msg)
 
     def _on_detection_error_main_thread(self, msg: str):
-        print(f"_on_detection_error_main_thread 被调用，错误信息: {msg}")
-        # 在主线程中更新UI
+        self._is_detecting = False
         self.btn_detect.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         self.lbl_status.setText(f"❌ 检测出错: {msg}")
 
-    # ── 手动操作 ─────────────────────────────────────────────
+    def _load_preview_image(self):
+        if not self.project or not self.project.video_path:
+            return None
+
+        import cv2
+
+        cap = cv2.VideoCapture(self.project.video_path)
+        if not cap.isOpened():
+            return None
+        ok, frame = cap.read()
+        cap.release()
+        if not ok:
+            return None
+
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = frame.shape
+        bytes_per_line = ch * w
+        return QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
+
+    def calibrate_hoop(self):
+        if not self.project:
+            QMessageBox.warning(self, "提示", "请先选择视频")
+            return
+
+        image = self._load_preview_image()
+        if image is None:
+            QMessageBox.warning(self, "提示", "无法读取视频首帧，暂时不能标定篮筐")
+            return
+
+        dialog = HoopCalibrationDialog(image, initial_rect=self.project.manual_hoop_rect, parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            rect = dialog.selected_rect()
+            if rect:
+                self.project.manual_hoop_rect = rect
+                self.project.save()
+                self._update_hoop_status()
+
+    def clear_manual_hoop(self):
+        if not self.project:
+            return
+        self.project.manual_hoop_rect = None
+        self.project.save()
+        self._update_hoop_status()
+
+    def _update_hoop_status(self):
+        if not self.project or not self.project.manual_hoop_rect:
+            self.lbl_hoop_status.setText("当前：未手动标定，将使用自动校准")
+            return
+        x, y, w, h = self.project.manual_hoop_rect
+        self.lbl_hoop_status.setText(f"当前：已手动标定篮筐 ({x}, {y}, {w}, {h})")
+
+    def _update_last_summary(self):
+        if not self.project or not self.project.last_detection_stats:
+            self.lbl_last_summary.setText("上次检测：—")
+            return
+
+        stats = self.project.last_detection_stats
+        if self.project.last_detection_failure_reason:
+            result_text = describe_failure_reason(self.project.last_detection_failure_reason)
+        elif stats.get("goal_candidates", 0) > 0:
+            result_text = "成功"
+        else:
+            result_text = "未产出候选"
+        sample_every_n = self.project.last_detection_config.get("sample_every_n")
+        self.lbl_last_summary.setText(
+            "上次检测："
+            f"已处理 {stats.get('processed_frames', 0)} 帧，"
+            f"篮筐命中 {stats.get('hoop_detected_frames', 0)}，"
+            f"篮球命中 {stats.get('ball_detected_frames', 0)}，"
+            f"候选进球 {stats.get('goal_candidates', 0)}，"
+            f"采样间隔 {sample_every_n or 1}，"
+            f"结果 {result_text}"
+        )
+
     def add_manual_clip(self):
         if not self.project:
             return
         val, ok = QInputDialog.getDouble(
-            self, "手动添加进球", "输入进球时间戳（秒）：",
-            0, 0, 99999, 1
+            self,
+            "手动添加进球",
+            "输入进球时间戳（秒）：",
+            0,
+            0,
+            99999,
+            1,
         )
         if ok:
             config = DetectionConfig(
@@ -348,37 +604,36 @@ class DetectionPage(QWidget):
 
     def select_video(self):
         from PyQt5.QtWidgets import QFileDialog
-        import os
-        
+
         video_path, _ = QFileDialog.getOpenFileName(
-            self, "选择篮球录像文件", "",
-            "视频文件 (*.mp4 *.mov *.avi *.mkv *.m4v);;所有文件 (*)"
+            self,
+            "选择篮球录像文件",
+            "",
+            "视频文件 (*.mp4 *.mov *.avi *.mkv *.m4v);;所有文件 (*)",
         )
         if not video_path:
             return
-        
-        # 如果没有项目，创建一个新项目，保存到视频所在目录
+
         if not self.project:
-            from app.core.project import Project
-            # 获取视频所在目录
             video_dir = os.path.dirname(video_path)
-            # 使用视频文件名作为项目名称
             video_name = os.path.splitext(os.path.basename(video_path))[0]
             project_dir = os.path.join(video_dir, f"{video_name}_project")
-            # 确保项目目录存在
             os.makedirs(project_dir, exist_ok=True)
-            
             self.project = Project(video_path=video_path, project_dir=project_dir)
             self.project.save()
-            
-            # 通知主窗口更新项目
-            if hasattr(self.parent(), 'project'):
+            if hasattr(self.parent(), "project"):
                 self.parent().project = self.project
         else:
+            if os.path.abspath(self.project.video_path) != os.path.abspath(video_path):
+                self.project.clips.clear()
+                self.project.detection_done = False
+                self.project.manual_hoop_rect = None
+                self.project.last_detection_stats = {}
+                self.project.last_detection_failure_reason = None
+                self.project.last_detection_config = {}
             self.project.video_path = video_path
             self.project.save()
-        
-        # 加载视频信息
+
         self.load_project(self.project)
 
     def finish_detection(self):
@@ -387,11 +642,12 @@ class DetectionPage(QWidget):
             return
         self.detection_finished.emit(self.project)
 
-    # ── 列表刷新 ─────────────────────────────────────────────
     def _refresh_list(self):
         self.clip_list.clear()
         if not self.project:
+            self.btn_next.setEnabled(False)
             return
+
         for clip in self.project.clips:
             tag = "🤖" if clip.confidence == "auto" else "✋"
             label = (
@@ -402,5 +658,5 @@ class DetectionPage(QWidget):
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, clip.clip_id)
             self.clip_list.addItem(item)
-        if self.project.clips:
-            self.btn_next.setEnabled(True)
+
+        self.btn_next.setEnabled(bool(self.project.clips))
